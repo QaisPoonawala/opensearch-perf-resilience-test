@@ -1,0 +1,31 @@
+{% raw %}{% import "benchmark.helpers" as benchmark with context %}{% endraw %}
+{
+  "version": 2,
+  "description": "Tracker-generated workload for {{workload_name}}",
+  "indices": [{% set comma = joiner() %}{% for index in indices %}{{comma()}}
+    {
+      "name": "{{index.name}}",
+      "body": "{{index.filename}}"
+    }{% endfor %}
+  ],
+  "corpora": [{% set comma = joiner() %}{% for corpus in corpora %}{{comma()}}
+    {
+      "name": "{{corpus.index_name}}",
+      "documents": [
+        {
+          "target-index": "{{corpus.index_name}}",
+          "source-file": "{{corpus.filename}}",
+          "document-count": {{corpus.doc_count}},
+          "compressed-bytes": {{corpus.compressed_bytes}},
+          "uncompressed-bytes": {{corpus.uncompressed_bytes}}
+        }
+      ]
+    }{% endfor %}
+  ],
+  "operations": [
+    {% raw %}{{ benchmark.collect(parts="operations/*.json") }}{% endraw %}
+  ],
+  "test_procedures": [
+    {% raw %}{{ benchmark.collect(parts="test_procedures/*.json") }}{% endraw %}
+  ]
+}

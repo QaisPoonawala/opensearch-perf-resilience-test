@@ -1,0 +1,452 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for OpenSearch Benchmark Infrastructure'
+
+Parameters:
+  VpcCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+    Description: CIDR block for the VPC
+
+  PublicSubnet1CIDR:
+    Type: String
+    Default: 10.0.1.0/24
+    Description: CIDR block for public subnet 1
+
+  PrivateSubnet1CIDR:
+    Type: String
+    Default: 10.0.2.0/24
+    Description: CIDR block for private subnet 1
+
+  PrivateSubnet2CIDR:
+    Type: String
+    Default: 10.0.3.0/24
+    Description: CIDR block for private subnet 2
+
+  OpenSearchDomainName:
+    Type: String
+    Default: benchmark-domain
+    Description: Name of the OpenSearch domain
+
+  ClusterConfig:
+    Type: String
+    Default: standard
+    AllowedValues:
+      - standard
+      - minimal
+      - coordinator
+    Description: >
+      Cluster configuration type:
+      'standard' - Multi-AZ with dedicated master nodes,
+      'minimal' - Multi-AZ without dedicated nodes,
+      'coordinator' - Multi-AZ with coordinator nodes
+
+  DataNodeCount:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 10
+    Description: Number of data nodes (must be even for Multi-AZ)
+
+  InstanceType:
+    Type: String
+    Default: m5.xlarge
+    AllowedValues:
+      - t3.large
+      - m5.large
+      - m5.xlarge
+      - m5.2xlarge
+    Description: EC2 instance type for the benchmark runner
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: Name of an existing EC2 KeyPair to enable SSH access to the instance
+
+  ScriptsBucketName:
+    Type: String
+    Description: Name of the S3 bucket containing benchmark scripts
+
+Resources:
+  # VPC and Network Configuration
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: !Ref VpcCIDR
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: OpenSearch-Benchmark-VPC
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: OpenSearch-Benchmark-IGW
+        - Key: Project
+          Value: OpenSearch-Benchmark
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PublicSubnet1CIDR
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: OpenSearch-Benchmark-Public-Subnet
+        - Key: Project
+          Value: OpenSearch-Benchmark
+
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet1CIDR
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: OpenSearch-Benchmark-Private-Subnet-1
+        - Key: Project
+          Value: OpenSearch-Benchmark
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: !Ref PrivateSubnet2CIDR
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: OpenSearch-Benchmark-Private-Subnet-2
+        - Key: Project
+          Value: OpenSearch-Benchmark
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: OpenSearch-Benchmark-Route-Table
+        - Key: Project
+          Value: OpenSearch-Benchmark
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: AttachGateway
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  # Security Groups
+  BenchmarkSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for benchmark EC2 instance
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: OpenSearch-Benchmark-EC2-SG
+        - Key: Project
+          Value: OpenSearch-Benchmark
+
+  OpenSearchSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for OpenSearch domain
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref BenchmarkSecurityGroup
+      Tags:
+        - Key: Name
+          Value: OpenSearch-Benchmark-Domain-SG
+        - Key: Project
+          Value: OpenSearch-Benchmark
+
+  # IAM Role and Instance Profile
+  BenchmarkRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Tags:
+        - Key: Name
+          Value: OpenSearch-Benchmark-IAM-Role
+        - Key: Project
+          Value: OpenSearch-Benchmark
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Policies:
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${ScriptsBucketName}
+                  - !Sub arn:aws:s3:::${ScriptsBucketName}/*
+        - PolicyName: OpenSearchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:ESHttp*
+                Resource: !Sub arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OpenSearchDomainName}/*
+
+  BenchmarkInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref BenchmarkRole
+
+  # OpenSearch Domain
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: !Ref OpenSearchDomainName
+      Tags:
+        - Key: Name
+          Value: OpenSearch-Benchmark-Domain
+        - Key: Project
+          Value: OpenSearch-Benchmark
+      EngineVersion: OpenSearch_2.5
+      ClusterConfig: !If
+        - IsStandardConfig
+        - # Standard configuration with dedicated master nodes
+          InstanceType: r6g.large.search
+          InstanceCount: !Ref DataNodeCount
+          DedicatedMasterEnabled: true
+          DedicatedMasterType: r6g.large.search
+          DedicatedMasterCount: 3
+          ZoneAwarenessEnabled: true
+          ZoneAwarenessConfig:
+            AvailabilityZoneCount: 2
+        - !If
+          - IsMinimalConfig
+          - # Minimal configuration without dedicated nodes
+            InstanceType: r6g.large.search
+            InstanceCount: !Ref DataNodeCount
+            DedicatedMasterEnabled: false
+            ZoneAwarenessEnabled: true
+            ZoneAwarenessConfig:
+              AvailabilityZoneCount: 2
+          - # Configuration with coordinator nodes
+            InstanceType: r6g.large.search
+            InstanceCount: !Ref DataNodeCount
+            DedicatedMasterEnabled: true
+            DedicatedMasterType: r6g.large.search
+            DedicatedMasterCount: 3
+            WarmEnabled: false
+            ColdEnabled: false
+            CoordinatorEnabled: true
+            CoordinatorInstanceType: r6g.large.search
+            CoordinatorInstanceCount: 2
+            ZoneAwarenessEnabled: true
+            ZoneAwarenessConfig:
+              AvailabilityZoneCount: 2
+      EBSOptions:
+        EBSEnabled: true
+        VolumeSize: 100
+        VolumeType: gp3
+      VPCOptions:
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+        SecurityGroupIds:
+          - !Ref OpenSearchSecurityGroup
+      EncryptionAtRestOptions:
+        Enabled: true
+      NodeToNodeEncryptionOptions:
+        Enabled: true
+      DomainEndpointOptions:
+        EnforceHTTPS: true
+        TLSSecurityPolicy: Policy-Min-TLS-1-2-2019-07
+      AdvancedSecurityOptions:
+        Enabled: true
+        InternalUserDatabaseEnabled: true
+        MasterUserOptions:
+          MasterUserName: admin
+          MasterUserPassword: Admin123!
+
+  # EC2 Instance for Benchmark
+  BenchmarkInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !FindInMap [RegionMap, !Ref 'AWS::Region', AMI]
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref BenchmarkSecurityGroup
+      IamInstanceProfile: !Ref BenchmarkInstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y git python3 python3-pip
+          pip3 install opensearch-py requests
+          
+          # Install AWS CLI and required packages
+          yum install -y git python3 python3-pip jq aws-cli
+
+          # Create benchmark directory
+          mkdir -p /home/ec2-user/opensearch-benchmark
+          cd /home/ec2-user/opensearch-benchmark
+
+          # Install required Python packages
+          pip3 install opensearch-py requests
+
+          # Download benchmark scripts from S3
+          aws s3 cp s3://${ScriptsBucketName}/benchmark-scripts.zip .
+          unzip benchmark-scripts.zip
+
+          # Create monitoring scripts directory
+          mkdir -p /home/ec2-user/monitoring-scripts
+          cd /home/ec2-user/monitoring-scripts
+
+          # Create cluster monitoring script
+          cat > monitor-cluster.sh << 'EOL'
+          #!/bin/bash
+          while true; do
+            echo "=== Cluster Health ==="
+            curl -s -u admin:Admin123! --insecure https://${OpenSearchDomain.DomainEndpoint}/_cluster/health | jq
+            
+            echo "=== Node Status ==="
+            curl -s -u admin:Admin123! --insecure https://${OpenSearchDomain.DomainEndpoint}/_cat/nodes?v
+            
+            echo "=== Shard Allocation ==="
+            curl -s -u admin:Admin123! --insecure https://${OpenSearchDomain.DomainEndpoint}/_cat/shards?v
+            
+            sleep 5
+          done
+          EOL
+          chmod +x monitor-cluster.sh
+
+          # Create performance monitoring script
+          cat > monitor-performance.sh << 'EOL'
+          #!/bin/bash
+          while true; do
+            echo "=== Thread Pools ==="
+            curl -s -u admin:Admin123! --insecure https://${OpenSearchDomain.DomainEndpoint}/_cat/thread_pool?v
+            
+            echo "=== JVM Stats ==="
+            curl -s -u admin:Admin123! --insecure https://${OpenSearchDomain.DomainEndpoint}/_nodes/stats/jvm | jq
+            
+            sleep 10
+          done
+          EOL
+          chmod +x monitor-performance.sh
+
+          # Set permissions
+          chown -R ec2-user:ec2-user /home/ec2-user/monitoring-scripts
+
+          # Set permissions
+          chown -R ec2-user:ec2-user /home/ec2-user/opensearch-benchmark
+          chmod -R 755 /home/ec2-user/opensearch-benchmark
+
+          # Install the package
+          cd /home/ec2-user/opensearch-benchmark
+          pip3 install -e .
+          
+          # Create benchmark configuration
+          cat > /home/ec2-user/.benchmark/benchmark.ini << 'EOL'
+          [meta]
+          config.version = 17
+
+          [system]
+          env.name = aws
+
+          [node]
+          root.dir = ~/.benchmark/benchmarks
+          src.root.dir = ~/.benchmark/benchmarks/src
+
+          [benchmarks]
+          local.dataset.cache = ~/.benchmark/benchmarks/data
+
+          [distributions]
+          release.cache = true
+
+          [results_publishing]
+          datastore.type = in-memory
+
+          [provision_configs]
+          default.dir = default-provision-config
+          EOL
+
+          chown -R ec2-user:ec2-user /home/ec2-user/.benchmark
+
+          # Create test script
+          cat > /home/ec2-user/run-benchmark.sh << 'EOL'
+          #!/bin/bash
+          opensearch-benchmark execute-test --target-hosts=${OpenSearchDomain.DomainEndpoint} \
+            --client-options="use_ssl:true,verify_certs:false,basic_auth_user:admin,basic_auth_password:Admin123!" \
+            --test-procedure=default --workload=geonames
+          EOL
+
+          chmod +x /home/ec2-user/run-benchmark.sh
+          chown ec2-user:ec2-user /home/ec2-user/run-benchmark.sh
+
+      Tags:
+        - Key: Name
+          Value: OpenSearch-Benchmark-Instance
+
+Conditions:
+  IsStandardConfig: !Equals [!Ref ClusterConfig, 'standard']
+  IsMinimalConfig: !Equals [!Ref ClusterConfig, 'minimal']
+  IsCoordinatorConfig: !Equals [!Ref ClusterConfig, 'coordinator']
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: ami-0cff7528ff583bf9a
+    us-east-2:
+      AMI: ami-02d1e544b84bf7502
+    us-west-1:
+      AMI: ami-0d9858aa3c6322f73
+    us-west-2:
+      AMI: ami-098e42ae54c764c35
+
+Outputs:
+  BenchmarkInstancePublicIP:
+    Description: Public IP of the benchmark EC2 instance
+    Value: !GetAtt BenchmarkInstance.PublicIp
+
+  OpenSearchDomainEndpoint:
+    Description: Endpoint of the OpenSearch domain
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
+
+  SSHCommand:
+    Description: SSH command to connect to the benchmark instance
+    Value: !Sub ssh -i ${KeyPairName}.pem ec2-user@${BenchmarkInstance.PublicIp}
